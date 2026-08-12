@@ -10,7 +10,12 @@ memory. When you press the button, the answer is already known: what passed
 closest, how long ago, and where you should have been looking.
 
 Polling costs nothing - it's a Pi that's already awake, and airplanes.live
-allows one request per second. We use one every 30.
+allows one request per second. We use one every 15 by default.
+
+Only tracks aircraft using your local airport (on the FIDS board, or plainly
+low and close to the field). Nothing else is worth showing, and skipping
+route lookups for everything else is what keeps this quota-free: the only
+thing here that costs AeroDataBox requests is fids.py's board refresh.
 """
 
 from __future__ import annotations
@@ -22,11 +27,7 @@ import time
 import requests
 
 import config
-from inkyapps import geo
-from inkyapps.airlines import airline_for, is_airline
-from inkyapps.fids import FidsBoard
-from inkyapps.flightinfo import FlightLookup
-from inkyapps.routes import RouteCache
+from inkyapps import fids, geo
 
 log = logging.getLogger(__name__)
 
@@ -42,13 +43,6 @@ USER_AGENT = "inky-apps/1.0 (personal e-ink display)"
 RECEDING_RATIO = 1.15
 PASSED_AFTER_S = 45
 
-# Sanity limits for a claimed route. An aircraft genuinely flying A to B is
-# near the line between them and pointing roughly at B. Generous enough for
-# airway dog-legs and weather deviations, tight enough to catch a route that
-# belongs to an entirely different flight.
-ROUTE_CORRIDOR_KM = 250
-ROUTE_HEADING_TOLERANCE = 75
-
 
 class Sighting:
     """What we know about one aircraft over the recent past."""
@@ -56,7 +50,7 @@ class Sighting:
     __slots__ = ("hex", "callsign", "type", "reg", "first_seen", "last_seen",
                  "closest_at", "closest_nm", "closest_bearing",
                  "closest_elevation", "closest_alt_ft", "alt_ft", "speed_kt",
-                 "track", "baro_rate", "current_nm", "route",
+                 "track", "baro_rate", "current_nm",
                  "eta_s", "eta_nm", "eta_at", "receding", "at_airport",
                  "fids", "lat", "lon")
 
@@ -76,7 +70,6 @@ class Sighting:
         self.track = None
         self.baro_rate = None
         self.current_nm = float("inf")
-        self.route = None          # filled in by the tracker, may stay None
         self.eta_s = None          # seconds to closest approach, at eta_at
         self.eta_nm = None         # how close it's predicted to get
         self.eta_at = 0.0
@@ -111,9 +104,7 @@ class Sighting:
     def airline(self) -> str:
         if self.fids and self.fids.airline:
             return self.fids.airline
-        if self.route and self.route.airline:
-            return self.route.airline
-        return airline_for(self.callsign)
+        return "Private / GA"
 
     @property
     def flight_number(self) -> str:
@@ -124,44 +115,28 @@ class Sighting:
         """
         if self.fids and self.fids.number:
             return self.fids.number
-        if self.route and self.route.number:
-            return self.route.number
         return ""
-
-    @property
-    def commercial(self) -> bool:
-        """An airline, cargo or military callsign rather than a registration."""
-        return is_airline(self.callsign)
 
     @property
     def local(self) -> bool:
         """Is it using your local airport?
 
-        Either the board has it, the route says so, or we saw it low and close
-        to the field - which is the only evidence available for private
-        flights, since they aren't in any route database.
+        Either the board has it, or we saw it low and close to the field -
+        which is the only evidence available for private flights, since they
+        never appear on the board at all.
         """
-        if self.fids:
-            return True
-        if self.at_airport:
-            return True
-        if self.route:
-            return self.route.direction(config.HOME_AIRPORT_IATA) != "overflight"
-        return False
+        return bool(self.fids) or self.at_airport
 
     @property
     def worth_showing(self) -> bool:
-        if not config.PLANES_HIDE_PRIVATE:
-            return True
-        return self.commercial or self.local
+        return self.local
 
     @property
     def observed_movement(self):
         """What we actually saw: climbing away from the field, or descending
         into it. None if we have no direct evidence.
 
-        This is first-hand observation, so it outranks anything a route
-        database says.
+        This is first-hand observation, so it outranks the board.
         """
         if not self.at_airport or self.baro_rate is None:
             return None
@@ -171,101 +146,24 @@ class Sighting:
             return "arrival"
         return None
 
-    @property
-    def route_geometry_ok(self) -> bool:
-        """Could this aircraft plausibly be flying the route we looked up?
-
-        Two tests: is it anywhere near the great circle between the two
-        airports, and is it pointing roughly at the destination. A recycled
-        callsign usually fails both by a wide margin - a Shannon-Faro route
-        claimed for an aircraft over Yorkshire is 486 km off course and
-        heading 143 degrees the wrong way.
-        """
-        if not config.PLANES_ROUTE_CHECK or not self.route:
-            return True
-        if self.route.authoritative:
-            return True        # looked up by airframe, not guessed
-        a, b = self.route.origin_pos, self.route.dest_pos
-        if not a or not b or self.lat is None:
-            return True                     # nothing to check against
-
-        corridor_km = geo.cross_track_m(a[0], a[1], b[0], b[1],
-                                        self.lat, self.lon) / 1000.0
-        if corridor_km > ROUTE_CORRIDOR_KM:
-            return False
-
-        if self.track is not None:
-            to_dest = geo.bearing_deg(self.lat, self.lon, b[0], b[1])
-            if geo.angle_difference(self.track, to_dest) > ROUTE_HEADING_TOLERANCE:
-                return False
-        return True
-
-    @property
-    def route_trusted(self) -> bool:
-        """Does the looked-up route agree with what we observed?
-
-        Callsigns get recycled - Ryanair's rotate constantly - so a route
-        database can return yesterday's leg for today's flight. If we saw an
-        aircraft descending into your airport and the route claims it's headed
-        somewhere else, the route is wrong for this flight.
-        """
-        if self.fids:
-            return True        # the airport's own board; nothing to doubt
-        if not self.route:
-            return False
-        observed = self.observed_movement
-        if observed is None:
-            # No first-hand evidence, so fall back to checking the geometry.
-            return self.route_geometry_ok
-        return self.route.direction(config.HOME_AIRPORT_IATA) == observed
-
     def route_summary(self):
         """(preposition, place, trusted), or None if there's nothing to say.
 
-        Splits what we know from what we're guessing. The preposition comes
-        from observation when we have it - if we watched it descend into your
-        airport, "from" is certain even when the place is not. An empty place
-        means the database route doesn't involve your airport at all, so there
-        is no sensible other end to name.
+        Always board-sourced now, so always trusted when present. No board
+        match (typically a private/GA flight) means no route to show.
         """
-        # The airport board is authoritative when it has this aircraft.
         if self.fids and self.fids.place:
             return self.fids.preposition, self.fids.place, True
-
-        if not self.route:
-            return None
-        if not self.route_geometry_ok:
-            return None        # demonstrably not this flight's route
-        home = config.HOME_AIRPORT_IATA
-        away = self.route.away_end(home)
-        observed = self.observed_movement
-
-        if observed:
-            preposition = "to" if observed == "departure" else "from"
-            if not away:
-                return preposition, "", False
-            return preposition, away[1], self.route_trusted
-
-        if away:
-            return away[0], away[1], True
         return None
 
     @property
     def movement(self) -> str:
-        """'departure', 'arrival' or 'overflight'."""
+        """'departure', 'arrival' or 'unknown'."""
         observed = self.observed_movement
         if observed:
-            return observed    # what we saw beats any database
+            return observed    # what we saw beats the board
         if self.fids:
             return self.fids.direction
-        if self.route:
-            direction = self.route.direction(config.HOME_AIRPORT_IATA)
-            if direction != "overflight":
-                return direction
-            if self.closest_alt_ft > 12000:
-                return "overflight"
-        if self.closest_alt_ft > 12000 and not self.at_airport:
-            return "overflight"
         if self.baro_rate is None:
             return "unknown"
         if self.baro_rate > 300:
@@ -295,21 +193,6 @@ class Sighting:
             return "level"
         return "climbing" if self.baro_rate > 0 else "descending"
 
-    def score(self) -> float:
-        """Lower is better. Close beats far, but recent beats stale.
-
-        You press the button because something just went over, so a plane
-        that passed 30 seconds ago should win over a slightly closer one from
-        eight minutes back. Tune the divisor to taste: smaller = more
-        aggressively recency-biased.
-        """
-        score = self.closest_nm * (1.0 + self.age_s / 300.0)
-        if config.PLANES_PREFER_WINDOW and not self.from_window:
-            score *= 1.8   # it passed behind the house; you didn't see it
-        if self.local:
-            score *= config.PLANES_LOCAL_BOOST   # using your airport
-        return score
-
 
 def _compose(upcoming: list, past: list) -> list:
     """Blend the two halves of the timeline into what the screen shows.
@@ -330,9 +213,7 @@ class AircraftTracker(threading.Thread):
         # (_target, _handle, _args, _kwargs, _name, _started).
         super().__init__(daemon=True, name="tracker")
         self._seen: dict[str, Sighting] = {}
-        self.routes = RouteCache()
-        self.board = FidsBoard()
-        self.flights = FlightLookup()
+        self.board = fids.BOARD    # shared with the home app - see fids.py
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self.last_poll_at = 0.0
@@ -378,33 +259,6 @@ class AircraftTracker(threading.Thread):
             self._prune(now)
         self.last_poll_at = now
         self._resolve_board()
-        self._resolve_flights()
-        self._resolve_routes()
-
-    def _resolve_flights(self) -> None:
-        """Look up the aircraft actually on screen, by airframe.
-
-        Deliberately stingy: only the few that would be displayed, only ones
-        the airport board couldn't already answer, and only a couple per poll
-        so a busy sky can't drain the daily allowance in one go.
-        """
-        if not config.FLIGHT_LOOKUP_ENABLED:
-            return
-        shown = self.recent()[:config.FLIGHT_LOOKUP_MAX]
-        fetched = 0
-        for s in shown:
-            if s.fids or not s.commercial:
-                continue
-            if s.route is not None and s.route.authoritative:
-                continue
-            cached = self.flights.cached_legs(s.hex) is not None
-            if not cached and fetched >= config.FLIGHT_LOOKUP_PER_POLL:
-                continue
-            route = self.flights.route_for(s.hex, allow_fetch=True)
-            if not cached:
-                fetched += 1
-            if route:
-                s.route = route
 
     def _resolve_board(self) -> None:
         """Refresh the airport board if due, then match it to what we can see.
@@ -413,8 +267,6 @@ class AircraftTracker(threading.Thread):
         because a schedule-only entry gains its Mode-S hex once the flight goes
         live - so an aircraft that didn't match five minutes ago may now.
         """
-        if not config.FIDS_ENABLED:
-            return
         if self.board.due():
             self.board.refresh()
         if not self.board.entry_count:
@@ -425,24 +277,6 @@ class AircraftTracker(threading.Thread):
             s.fids = self.board.lookup(hexid=s.hex, reg=s.reg,
                                        callsign=s.callsign,
                                        movement=s.observed_movement)
-
-    def _resolve_routes(self) -> None:
-        """One batched route lookup per poll, for callsigns we don't know yet.
-
-        Done outside the lock and after pruning, so a slow or failing route
-        API never holds up position tracking - routes are decoration.
-        """
-        if not config.PLANES_ROUTE_LOOKUP:
-            return
-        with self._lock:
-            wanted = [s.callsign for s in self._seen.values()
-                      if s.route is None and any(c.isdigit() for c in s.callsign)]
-        if wanted:
-            self.routes.lookup(wanted, config.LATITUDE, config.LONGITUDE)
-        with self._lock:
-            for s in self._seen.values():
-                if s.route is None:
-                    s.route = self.routes.get(s.callsign)
 
     def _absorb(self, ac: dict, now: float) -> None:
         lat, lon, alt = ac.get("lat"), ac.get("lon"), ac.get("alt_baro")
@@ -477,8 +311,8 @@ class AircraftTracker(threading.Thread):
         s.lat, s.lon = lat, lon
 
         # Low and close to the field: it's using your airport, whether or not
-        # any route database has heard of it. Sticky - once true, stays true
-        # for the life of the sighting.
+        # the board has it yet. Sticky - once true, stays true for the life
+        # of the sighting.
         if alt <= config.HOME_AIRPORT_MAX_ALT_FT and not s.at_airport:
             apt_nm = geo.ground_distance_m(
                 config.HOME_AIRPORT_LAT, config.HOME_AIRPORT_LON,
@@ -519,27 +353,19 @@ class AircraftTracker(threading.Thread):
     # --- reading ---------------------------------------------------------
 
     def recent(self) -> list:
-        """Everything worth showing, in display order.
-
-        "time"      - what's coming, soonest first, then what's been, most
-                      recent first. Reads like a timeline through now.
-        "relevance" - closest and most recent, weighted towards your window
-                      and your local airport. The older behaviour.
+        """Everything worth showing: what's coming, soonest first, then what's
+        been, most recent first. Reads like a timeline through now.
         """
         with self._lock:
             items = list(self._seen.values())
         shown = [s for s in items if s.worth_showing]
         self.hidden = len(items) - len(shown)
 
-        if getattr(config, "PLANES_SORT", "time") == "time":
-            upcoming = [s for s in shown if s.approaching]
-            past = [s for s in shown if not s.approaching]
-            upcoming.sort(key=lambda s: s.eta_remaining or 0.0)
-            past.sort(key=lambda s: s.age_s)
-            return _compose(upcoming, past)
-
-        shown.sort(key=lambda s: s.score())
-        return shown
+        upcoming = [s for s in shown if s.approaching]
+        past = [s for s in shown if not s.approaching]
+        upcoming.sort(key=lambda s: s.eta_remaining or 0.0)
+        past.sort(key=lambda s: s.age_s)
+        return _compose(upcoming, past)
 
     def status(self) -> str:
         if self.last_error:
@@ -550,7 +376,7 @@ class AircraftTracker(threading.Thread):
         note = f"updated {age}s ago"
         board = self.board.status()
         if board:
-            note += f"  \u00b7  {board}"
+            note += f"  ·  {board}"
         if self.hidden:
-            note += f"  \u00b7  {self.hidden} hidden"
+            note += f"  ·  {self.hidden} hidden"
         return note

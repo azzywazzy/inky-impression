@@ -137,4 +137,4 @@ def compass_point(bearing: float) -> str:
 
 def look_direction(bearing: float, elevation: float) -> str:
     """A human instruction: 'SSW, 38 up'."""
-    return f"{compass_point(bearing)} \u00b7 {elevation:.0f}\u00b0 up"
+    return f"{compass_point(bearing)} · {elevation:.0f}° up"

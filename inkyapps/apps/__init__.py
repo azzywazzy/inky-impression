@@ -6,13 +6,14 @@ modules are never imported, so they can't break a run.
 
 from inkyapps.apps.base import App
 from inkyapps.apps.apod import ApodApp
+from inkyapps.apps.home import HomeApp
 from inkyapps.apps.planes import PlanesApp
 
 REGISTRY: dict[str, App] = {
     app.name: app for app in (
         ApodApp(),
         PlanesApp(),
-        # HomeApp(),     # button A - clock, weather, etc. Not built yet.
+        HomeApp(),
     )
 }
 

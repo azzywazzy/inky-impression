@@ -19,11 +19,12 @@ echo "Organising $(pwd)"
 mkdir -p inkyapps/apps
 
 # Files that belong in inkyapps/
-PACKAGE="airlines.py buttons.py display.py geo.py layout.py routes.py tracker.py"
+PACKAGE="buttons.py display.py fids.py geo.py layout.py tracker.py weather.py"
 # Files that belong in inkyapps/apps/
-APPS="apod.py base.py planes.py clock.py"
+APPS="apod.py base.py clock.py home.py planes.py"
 # Everything else that's a top-level script stays where it is:
-#   config.py doctor.py preview.py routetest.py run.py selftest.py serve.py
+#   config.py doctor.py fidsmatch.py keys.py keys.example.py preview.py
+#   run.py selftest.py serve.py
 
 moved=0
 

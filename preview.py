@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Render an app to a PNG without touching the panel.
 
-    python preview.py planes                 # -> preview-planes.png
-    INKYAPPS_DEMO=1 python preview.py planes # synthetic aircraft, no network
+    python preview.py apod                 # -> preview-apod.png
+    INKYAPPS_DEMO=1 python preview.py apod # synthetic data, no network
 
 Use this for layout work. A real refresh costs 30 seconds and a chunk of the
 panel's rated lifetime; a PNG costs nothing, so iterate here and only push to

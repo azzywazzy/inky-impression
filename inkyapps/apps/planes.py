@@ -5,6 +5,8 @@ a 30-second panel refresh finishes, a departing aircraft is long gone - so the
 useful question isn't "what's overhead now" but "what passed closest, and how
 long ago". The tracker has that answer waiting before you press the button.
 
+Only ever shows Leeds Bradford arrivals/departures - see tracker.py for why.
+
 The sky dome on the left plots each aircraft where it was in your sky at its
 closest approach: centre is directly overhead, the outer ring is the horizon.
 """
@@ -13,7 +15,6 @@ from __future__ import annotations
 
 import math
 import os
-import time
 from datetime import datetime
 
 from PIL import ImageDraw
@@ -34,9 +35,8 @@ def _altitude_colour(feet: float) -> int:
 
 
 MOVEMENT = {
-    "departure": ("\u2191 DEPARTED", RED),
-    "arrival": ("\u2193 ARRIVING", BLUE),
-    "overflight": ("\u2022 OVERFLIGHT", BLACK),
+    "departure": ("↑ DEPARTED", RED),
+    "arrival": ("↓ ARRIVING", BLUE),
     "unknown": ("", BLACK),
 }
 
@@ -184,17 +184,14 @@ class PlanesApp(App):
 
     def sightings(self):
         if os.environ.get("INKYAPPS_DEMO"):
+            from inkyapps.tracker import _compose
             items = _demo_sightings()
             shown = [s for s in items if s.worth_showing]
-            if config.PLANES_SORT == "time":
-                from inkyapps.tracker import _compose
-                upcoming = [s for s in shown if s.approaching]
-                past = [s for s in shown if not s.approaching]
-                upcoming.sort(key=lambda s: s.eta_remaining or 0.0)
-                past.sort(key=lambda s: s.age_s)
-                return _compose(upcoming, past)
-            shown.sort(key=lambda s: s.score())
-            return shown
+            upcoming = [s for s in shown if s.approaching]
+            past = [s for s in shown if not s.approaching]
+            upcoming.sort(key=lambda s: s.eta_remaining or 0.0)
+            past.sort(key=lambda s: s.age_s)
+            return _compose(upcoming, past)
         if self.tracker is None:
             return []
         return self.tracker.recent()
@@ -254,7 +251,7 @@ class PlanesApp(App):
             draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=BLACK,
                          width=1)
             # Small angle labels below the centre, where markers cluster least.
-            label = f"{elev}\u00b0"
+            label = f"{elev}°"
             lw = text_width(label, fring)
             lx0, ly0 = cx - lw / 2 - 2, cy + r - 12
             draw.rectangle((lx0, ly0, lx0 + lw + 4, ly0 + 12), fill=WHITE)
@@ -340,12 +337,12 @@ class PlanesApp(App):
             draw.text((x0, y0 + 26), "Quiet sky", fill=BLACK,
                       font=font(24, bold=True))
             f = font(13)
-            note = ("Nothing within "
-                    f"{_distance(config.SEARCH_RADIUS_NM)} in the last "
+            note = ("Nothing using LBA in the last "
                     f"{config.PLANES_MEMORY_MINUTES} min")
+            y = y0 + 26 + 40   # clear of the title's descenders
             for line in _wrap(note, f, width):
-                y0 += 22
-                draw.text((x0, y0 + 26), line, fill=BLACK, font=f)
+                draw.text((x0, y), line, fill=BLACK, font=f)
+                y += 18
             return 0
 
         top = planes[0]
@@ -376,33 +373,24 @@ class PlanesApp(App):
                       number, fill=BLUE, font=fnum)
         y += 28
 
-        # adsbdb often names the operator; fall back to the callsign table.
-        operator = (top.route.airline if top.route and top.route.airline
-                    else top.airline)
-        draw.text((x0, y), truncate(operator, f, width), fill=BLACK, font=f)
+        draw.text((x0, y), truncate(top.airline, f, width), fill=BLACK, font=f)
         y += 18
 
-        sub = " \u00b7 ".join(p for p in (top.type, top.reg) if p)
+        sub = " · ".join(p for p in (top.type, top.reg) if p)
         if sub:
             draw.text((x0, y), truncate(sub, fs, width), fill=BLACK, font=fs)
             y += 16
 
-        # Route: place names if they fit, airport codes if they don't.
+        # Route: straight from the airport board, so always trusted when
+        # present. No board match (usually private/GA) means no route to show.
         fr = font(15, bold=True)
-        # An overflight's route comes from the callsign, which gets recycled,
-        # so it only gets shown if the geometry supports it.
-        if not top.route or not top.route_geometry_ok:
-            draw.text((x0, y), "route unknown", fill=ORANGE, font=font(12))
+        summary = top.route_summary()
+        if not summary:
+            draw.text((x0, y), "no board match", fill=ORANGE, font=font(12))
             y += 20
         else:
-            # One end of the route is your own airport, so name only the other
-            # end - "to Palma de Mallorca" fits where "Leeds -> Palma de
-            # Mallorca" would have been truncated back to bare codes.
-            away = top.route.away_end(config.HOME_AIRPORT_IATA)
-            if away:
-                text = f"{away[0]} {away[1]}"
-            else:
-                text = top.route.long() or top.route.short()
+            preposition, place, _trusted = summary
+            text = f"{preposition} {place}"
             draw.text((x0, y), truncate(text, fr, width), fill=BLUE, font=fr)
             y += 22
 
@@ -418,18 +406,18 @@ class PlanesApp(App):
 
         if top.approaching and top.eta_nm is not None:
             # Predicted: how close it will get, not how close it has been.
-            look = (f"{geo.compass_point(top.closest_bearing)} \u00b7 "
+            look = (f"{geo.compass_point(top.closest_bearing)} · "
                     f"will pass {_distance(top.eta_nm)} away")
         else:
-            look = (f"{geo.compass_point(top.closest_bearing)} \u00b7 "
-                    f"{top.closest_elevation:.0f}\u00b0 up \u00b7 "
+            look = (f"{geo.compass_point(top.closest_bearing)} · "
+                    f"{top.closest_elevation:.0f}° up · "
                     f"{_distance(top.closest_nm)}")
         draw.text((x0, y), truncate(look, fs, width), fill=BLACK, font=fs)
         y += 16
 
         if config.WINDOW_BEARING is not None:
             if top.from_window:
-                draw.text((x0, y), "\u2713 across your window", fill=GREEN,
+                draw.text((x0, y), "✓ across your window", fill=GREEN,
                           font=fs)
             else:
                 draw.text((x0, y), "behind the house", fill=ORANGE, font=fs)
@@ -450,8 +438,7 @@ class PlanesApp(App):
                 break
             listed = n
             _badge(draw, x0, y, n, r=7)
-            mark = {"departure": "\u2191", "arrival": "\u2193"}.get(
-                other.movement, "\u2022")
+            mark = {"departure": "↑", "arrival": "↓"}.get(other.movement, "•")
             head = f"{mark} {other.callsign}"
             age = _when(other, short=True)
             age_w = text_width(age, fs)
@@ -467,23 +454,12 @@ class PlanesApp(App):
                       fill=BLACK if other.passed else BLUE, font=fs)
             y += 15
 
-            # Operator, then route and distance. adsbdb names the operator
-            # when it knows the route; otherwise fall back to the callsign
-            # prefix table, which works offline.
-            operator = (other.route.airline if other.route and other.route.airline
-                        else other.airline)
+            operator = other.airline
             summary = other.route_summary()
             route_colour = BLUE
             if summary and summary[1]:
-                preposition, place, trusted = summary
+                preposition, place, _trusted = summary
                 route_text = f"{preposition} {place}"
-                if not trusted:
-                    route_text += " ?"
-                    route_colour = ORANGE
-            elif summary:
-                route_text, route_colour = "route unsure", ORANGE
-            elif other.route and other.route_geometry_ok:
-                route_text = other.route.short()
             else:
                 route_text = ""
             nm = _distance(other.closest_nm)
@@ -493,7 +469,7 @@ class PlanesApp(App):
                 draw.text((indent, y), truncate(operator, fs, avail),
                           fill=BLACK, font=fs)
                 y += 14
-                tail = f"{route_text} \u00b7 {nm}" if route_text else nm
+                tail = f"{route_text} · {nm}" if route_text else nm
                 draw.text((indent, y), truncate(tail, fs, avail),
                           fill=route_colour, font=fs)
                 y += 18
@@ -506,11 +482,11 @@ class PlanesApp(App):
                 if route_text:
                     # Prefer dropping the distance whole to truncating it into
                     # a meaningless fragment - the dome shows position anyway.
-                    full = f" \u00b7 {route_text} \u00b7 {nm}"
+                    full = f" · {route_text} · {nm}"
                     tail = full if text_width(full, fs) <= room \
-                        else f" \u00b7 {route_text}"
+                        else f" · {route_text}"
                 else:
-                    tail = f" \u00b7 {nm}"
+                    tail = f" · {nm}"
                 draw.text((indent + used, y), truncate(tail, fs, room),
                           fill=route_colour, font=fs)
                 y += 18
@@ -537,25 +513,23 @@ def _wrap(text, f, max_w):
 
 def _demo_sightings():
     """Fake history so the layout can be worked on offline."""
+    import time
     from inkyapps.tracker import Sighting
-    from inkyapps.routes import Route
+    from inkyapps.fids import FidsEntry
+
     now = time.time()
     spec = [
-        ("4ca1f2", "EXS811", "B738", "G-JZHW", 0.9, 42, 310, 2400, 45, 1800,
-         ("Leeds", "Palma", "LBA", "PMI")),
-        ("406b9a", "RYR7GX", "B38M", "EI-HAT", 1.6, 28, 118, 5200, 150, -1200,
-         ("Dublin", "Leeds", "DUB", "LBA")),
-        ("39c204", "AFR1180", "A21N", "F-HTAX", 8.2, 61, 205, 31000, 240, 0,
-         ("Paris", "Dublin", "CDG", "DUB")),
-        ("4ba9d1", "EZY44KL", "A320", "G-EZTA", 3.4, 12, 260, 9800, 420, -900,
-         ("Geneva", "Leeds", "GVA", "LBA")),
-        ("4009a8", "GCJKL", "R44", "G-CJKL", 2.2, 20, 45, 1400, 300, 0, None),
-        ("40aa11", "GBXTZ", "C172", "G-BXTZ", 4.1, 15, 70, 2000, 200, 0, None),
-        ("4ca9f0", "TOM7GH", "B38M", "G-TUMC", 5.6, 33, 285, 14000, 330, 1400,
-         ("Leeds", "Tenerife South", "LBA", "TFS")),
+        # hex, callsign, type, reg, nm, elev, bearing, alt_ft, age_s, baro_rate
+        ("4ca1f2", "EXS811", "B738", "G-JZHW", 0.9, 42, 310, 2400, 45, 1800),
+        ("406b9a", "RYR7GX", "B38M", "EI-HAT", 1.6, 28, 118, 5200, 150, -1200),
+        ("39c204", "AFR1180", "A21N", "F-HTAX", 8.2, 61, 205, 31000, 240, 0),
+        ("4ba9d1", "EZY44KL", "A320", "G-EZTA", 3.4, 12, 260, 9800, 420, -900),
+        ("4009a8", "GCJKL", "R44", "G-CJKL", 2.2, 20, 45, 1400, 300, 0),
+        ("40aa11", "GBXTZ", "C172", "G-BXTZ", 4.1, 15, 70, 2000, 200, 0),
+        ("4ca9f0", "TOM7GH", "B38M", "G-TUMC", 5.6, 33, 285, 14000, 330, 1400),
     ]
     out = []
-    for hexid, cs, typ, reg, nm, elev, brg, alt, age, rate, route in spec:
+    for hexid, cs, typ, reg, nm, elev, brg, alt, age, rate in spec:
         s = Sighting(hexid)
         s.callsign, s.type, s.reg = cs.strip(), typ, reg
         s.closest_nm, s.closest_elevation = nm, elev
@@ -572,10 +546,9 @@ def _demo_sightings():
             s.eta_s, s.eta_nm, s.eta_at = 70.0, 2.2, now
         else:
             s.current_nm = nm * 2
-        # LBA movements are flagged local; the light aircraft are not, so the
-        # filter can be seen working.
+        # LBA movements are flagged local; the light aircraft/overflight are
+        # not, so the filter can be seen working.
         s.at_airport = hexid in ("4ca1f2", "406b9a", "4ba9d1", "4009a8")
-        # Pretend the airport board matched some of them.
         board = {
             "4ca1f2": ("departure", "LS 811", "Jet2", "Palma de Mallorca"),
             "406b9a": ("arrival", "FR 2327", "Ryanair", "Palma De Mallorca"),
@@ -583,21 +556,11 @@ def _demo_sightings():
             "4ca9f0": ("departure", "LS 1729", "TUI Airways", "Tenerife South"),
         }
         if hexid in board:
-            from inkyapps.fids import FidsEntry
             d, num, air, place = board[hexid]
             s.fids = FidsEntry(d, {"number": num,
                                    "airline": {"name": air},
                                    "movement": {"airport": {"name": place},
                                                 "runway": "32",
                                                 "quality": ["Basic", "Live"]}})
-        if route:
-            a, b, ai, bi = route
-            # keyword args - Route has gained fields before now
-            s.route = Route(origin=a, destination=b, origin_iata=ai,
-                            destination_iata=bi, legs=[ai, bi])
         out.append(s)
-    upcoming = [s for s in out if s.approaching]
-    past = [s for s in out if not s.approaching]
-    upcoming.sort(key=lambda s: s.eta_remaining or 0.0)
-    past.sort(key=lambda s: s.age_s)
-    return upcoming + past
+    return out

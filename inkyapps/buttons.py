@@ -90,15 +90,21 @@ class ButtonPad(threading.Thread):
         if letter is None:
             return
 
-        now = time.monotonic()
-        if now - self._last_press.get(letter, 0.0) < DEBOUNCE_S:
-            return
-        self._last_press[letter] = now
-
+        # Checked before debouncing: a genuine hold takes a real 5 seconds, so
+        # it can never be mistaken for mechanical bounce. Gating it behind the
+        # debounce window like every other press meant a hold started soon
+        # after an earlier tap (e.g. tap D, tap D, hold D in quick succession)
+        # got silently dropped here before it was ever evaluated - shutdown
+        # would then not trigger no matter how long the button stayed down.
         if letter == "D" and self.hold_d_to_shutdown and self._still_held("D"):
             log.warning("button D held - shutting down")
             subprocess.run(["sudo", "poweroff"], check=False)
             return
+
+        now = time.monotonic()
+        if now - self._last_press.get(letter, 0.0) < DEBOUNCE_S:
+            return
+        self._last_press[letter] = now
 
         if letter == self.detail_letter and self.on_detail:
             log.info("button %s pressed -> detail view", letter)

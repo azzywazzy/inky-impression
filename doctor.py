@@ -37,23 +37,31 @@ def check(label: str, fn):
     return True
 
 
+# --- keys -------------------------------------------------------------
+def keys_file():
+    import pathlib
+    if not (pathlib.Path(__file__).parent / "keys.py").exists():
+        raise FileNotFoundError(
+            "keys.py not found - copy keys.example.py to keys.py and fill "
+            "in your own keys")
+    return "found"
+
+
 # --- config ---------------------------------------------------------------
 REQUIRED_CONFIG = [
-    "LATITUDE", "LONGITUDE", "OBSERVER_ALT_M", "SEARCH_RADIUS_NM",
-    "MIN_ELEVATION_DEG", "MAX_POSITION_AGE_S", "PLANES_POLL_SECONDS",
-    "PLANES_MEMORY_MINUTES", "HOME_AIRPORT_IATA", "PLANES_ROUTE_LOOKUP", "PLANES_ROUTE_CHECK",
-    "WINDOW_BEARING", "WINDOW_FOV_DEG", "PLANES_PREFER_WINDOW",
-    "HOME_AIRPORT_ICAO", "AERODATABOX_KEY", "FIDS_ENABLED",
-    "FIDS_REFRESH_MINUTES", "FIDS_WINDOW_HOURS", "FIDS_OFFSET_MINUTES",
-    "FLIGHT_LOOKUP_ENABLED", "FLIGHT_LOOKUP_DAILY_BUDGET",
-    "FLIGHT_LOOKUP_MAX", "FLIGHT_LOOKUP_PER_POLL", "FLIGHT_CACHE_HOURS",
-    "HOME_AIRPORT_LAT", "HOME_AIRPORT_LON", "HOME_AIRPORT_RADIUS_NM",
-    "HOME_AIRPORT_MAX_ALT_FT", "PLANES_HIDE_PRIVATE", "PLANES_LOCAL_BOOST", "PLANES_LIST_STYLE", "PLANES_SORT", "PLANES_MAX_SHOWN",
-    "PLANES_MAX_PAST", "PLANES_MIN_UPCOMING", "DISTANCE_UNIT",
-    "DOME_ORIENTATION", "BUTTON_APPS", "BUTTON_STRIP", "STARTUP_APP", "DETAIL_BUTTON",
+    "BUTTON_APPS", "BUTTON_STRIP", "STARTUP_APP", "DETAIL_BUTTON",
     "SATURATION", "MIN_REFRESH_INTERVAL_S", "NASA_API_KEY", "CACHE_DIR",
     "APOD_SATURATION", "APOD_CONTRAST", "APOD_FIT",
     "APOD_ASPECT_TOLERANCE",
+    "AERODATABOX_KEY", "LATITUDE", "LONGITUDE", "OBSERVER_ALT_M",
+    "WINDOW_BEARING", "WINDOW_FOV_DEG", "DOME_ORIENTATION", "HOME_AIRPORT_IATA",
+    "HOME_AIRPORT_ICAO", "HOME_AIRPORT_LAT", "HOME_AIRPORT_LON",
+    "HOME_AIRPORT_RADIUS_NM", "HOME_AIRPORT_MAX_ALT_FT", "SEARCH_RADIUS_NM",
+    "PLANES_POLL_SECONDS", "PLANES_MEMORY_MINUTES", "MIN_ELEVATION_DEG",
+    "MAX_POSITION_AGE_S", "FIDS_REFRESH_MINUTES", "FIDS_WINDOW_HOURS",
+    "FIDS_OFFSET_MINUTES", "PLANES_MAX_SHOWN", "PLANES_MAX_PAST",
+    "PLANES_MIN_UPCOMING", "PLANES_LIST_STYLE", "DISTANCE_UNIT",
+    "MORNING_APP", "MORNING_TIME", "WEATHER_REFRESH_MINUTES", "FORECAST_DAYS",
 ]
 
 
@@ -69,41 +77,29 @@ def config_sanity():
     import config
     notes = []
     if config.NASA_API_KEY in ("", "PUT_YOUR_KEY_HERE"):
-        notes.append("NASA_API_KEY not set (button B will fail)")
-    if getattr(config, "FIDS_ENABLED", False) and \
-            getattr(config, "AERODATABOX_KEY", "") in ("", "PUT_YOUR_KEY_HERE"):
-        notes.append("AERODATABOX_KEY not set - no flight numbers, and routes "
-                     "fall back to the callsign database")
-    if abs(config.LATITUDE - 51.5074) < 1e-6:
-        notes.append("LATITUDE is still the London default")
-    if config.OBSERVER_ALT_M <= 30:
-        notes.append(f"OBSERVER_ALT_M is {config.OBSERVER_ALT_M}m - low for "
-                     "the Leeds area, elevation angles will read high")
-    if config.LONGITUDE > 0:
-        notes.append("LONGITUDE is positive - west of Greenwich should be "
-                     "negative")
+        notes.append("NASA_API_KEY not set (button C will fail)")
+    if config.AERODATABOX_KEY in ("", "PUT_YOUR_KEY_HERE"):
+        notes.append("AERODATABOX_KEY not set (button B will show no "
+                     "flight numbers)")
     if notes:
         raise ValueError("; ".join(notes))
-    return "coordinates and key look plausible"
+    return "keys look plausible"
 
 
 # --- cross-module expectations -------------------------------------------
 def module_contracts():
-    from inkyapps import (geo, layout, routes, airlines, tracker, fids,
-                          flightinfo)
+    from inkyapps import fids, geo, layout, tracker, weather
 
     wanted = {
-        "geo": (geo, ["ground_distance_m", "bearing_deg", "elevation_deg",
-                      "slant_range_m", "compass_point", "within_arc",
-                      "FEET_TO_M", "M_TO_NM"]),
         "layout": (layout, ["new_canvas", "draw_header", "draw_button_strip",
                             "quantize_photo", "prepare_photo", "error_screen",
                             "font", "text_width", "truncate"]),
-        "routes": (routes, ["RouteCache", "Route"]),
-        "airlines": (airlines, ["airline_for"]),
+        "geo": (geo, ["ground_distance_m", "bearing_deg", "elevation_deg",
+                      "slant_range_m", "compass_point", "within_arc",
+                      "FEET_TO_M", "M_TO_NM"]),
+        "fids": (fids, ["FidsBoard", "FidsEntry", "BOARD"]),
         "tracker": (tracker, ["AircraftTracker", "Sighting"]),
-        "fids": (fids, ["FidsBoard", "FidsEntry"]),
-        "flightinfo": (flightinfo, ["FlightLookup"]),
+        "weather": (weather, ["WeatherCache", "pollen_level", "uv_level"]),
     }
     for name, (mod, attrs) in wanted.items():
         missing = [a for a in attrs if not hasattr(mod, a)]
@@ -112,25 +108,36 @@ def module_contracts():
                 f"{name}.py is out of date - missing {', '.join(missing)}")
 
     s = tracker.Sighting("abc123")
-    for attr in ("from_window", "airline", "movement", "climb", "age_s",
-                 "passed", "score", "route", "commercial", "local",
+    for attr in ("hex", "callsign", "reg", "from_window", "airline",
+                 "movement", "climb", "age_s", "passed", "local",
                  "worth_showing", "eta_remaining", "approaching",
-                 "flight_number", "fids", "route_summary",
-                 "route_geometry_ok"):
+                 "flight_number", "fids", "route_summary"):
         if not hasattr(s, attr):
             raise AttributeError(
                 f"tracker.py is out of date - Sighting has no {attr!r}")
-    return "geo, layout, routes, airlines, tracker agree"
+
+    if not hasattr(fids.BOARD, "last_and_next"):
+        raise AttributeError("fids.py is out of date - BOARD has no "
+                             "last_and_next")
+
+    w = weather.WeatherCache()
+    for attr in ("due", "refresh", "status", "dominant_pollen", "code",
+                 "forecast"):
+        if not hasattr(w, attr):
+            raise AttributeError(
+                f"weather.py is out of date - WeatherCache has no {attr!r}")
+    return "geo, fids, tracker, weather, layout agree"
 
 
 def app_registry():
     from inkyapps.apps import REGISTRY
     import config
     mapped = {v for v in config.BUTTON_APPS.values() if v}
+    mapped |= {a for a in (config.STARTUP_APP, config.MORNING_APP) if a}
     unknown = mapped - set(REGISTRY)
     if unknown:
-        raise KeyError(f"BUTTON_APPS points at unregistered app(s): "
-                       f"{', '.join(sorted(unknown))}")
+        raise KeyError(f"BUTTON_APPS/STARTUP_APP/MORNING_APP points at "
+                       f"unregistered app(s): {', '.join(sorted(unknown))}")
     for name, app in REGISTRY.items():
         for attr in ("render", "start", "name", "show_buttons"):
             if not hasattr(app, attr):
@@ -152,6 +159,7 @@ def render_all():
 
 def main() -> int:
     print(f"inky-apps doctor  (Python {sys.version.split()[0]})\n")
+    check("keys.py exists (copied from keys.example.py)", keys_file)
     check("config.py has every setting the code expects", config_keys)
     check("config.py values look set up", config_sanity)
     check("modules are mutually consistent", module_contracts)

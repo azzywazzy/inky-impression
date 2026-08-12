@@ -3,10 +3,10 @@
     GET https://aerodatabox.p.rapidapi.com/flights/airports/icao/EGNM
         ?offsetMinutes=-120&durationMinutes=720
 
-Why this exists: adsbdb maps callsign to route, but callsigns are recycled -
-Jet2's LS 448 flew as EXS36PN today and something else tomorrow - so the answer
-is often for a different flight entirely. The airport's own board doesn't have
-that problem, and it carries the aircraft's Mode-S hex, which is the same
+Why this exists: matching aircraft by callsign is unreliable - callsigns get
+recycled and reassigned mid-flight, so a callsign-keyed lookup often answers
+for a different flight entirely. The airport's own board doesn't have that
+problem, and it carries the aircraft's Mode-S hex, which is the same
 identifier ADS-B gives us. Joining on that is exact.
 
 Two useful details from the real response:
@@ -16,6 +16,9 @@ Two useful details from the real response:
   callSign - which is fine, because an aircraft near you is always live.
 - For a departure, `movement.airport` is where it's going; for an arrival,
   where it came from. Either way it's the end that isn't your airport.
+
+This is the only thing in the planes app that costs AeroDataBox quota - kept
+to one request per FIDS_REFRESH_MINUTES, however often the tracker polls.
 """
 
 from __future__ import annotations
@@ -112,6 +115,7 @@ class FidsBoard:
         self._by_hex: dict[str, list] = {}
         self._by_reg: dict[str, list] = {}
         self._by_callsign: dict[str, list] = {}
+        self._entries: list = []
         self.refreshed_at = 0.0
         self.last_error: str | None = None
         self.entry_count = 0
@@ -122,17 +126,10 @@ class FidsBoard:
 
     def due(self) -> bool:
         """Is a refresh due? Says why not, once, rather than failing quietly."""
-        if not config.FIDS_ENABLED:
-            self._warn("disabled", "FIDS_ENABLED is False in config.py - "
-                       "flight numbers and routes will come from the "
-                       "callsign database instead")
-            return False
-
         key = getattr(config, "AERODATABOX_KEY", "")
         if not key or key == "PUT_YOUR_KEY_HERE":
-            self._warn("nokey", "AERODATABOX_KEY is not set in config.py - "
-                       "the airport board is unavailable, so routes fall back "
-                       "to the callsign database")
+            self._warn("nokey", "AERODATABOX_KEY is not set in keys.py - "
+                       "the airport board is unavailable")
             return False
 
         if not getattr(config, "HOME_AIRPORT_ICAO", ""):
@@ -176,7 +173,7 @@ class FidsBoard:
 
     def _rebuild(self, data: dict) -> None:
         by_hex, by_reg, by_cs = {}, {}, {}
-        count = 0
+        entries = []
         runways = {}
 
         for direction, key in (("departure", "departures"),
@@ -186,7 +183,7 @@ class FidsBoard:
                     entry = FidsEntry(direction, raw)
                 except Exception:  # noqa: BLE001 - skip a malformed record
                     continue
-                count += 1
+                entries.append(entry)
                 if entry.modes:
                     by_hex.setdefault(entry.modes, []).append(entry)
                 if entry.reg:
@@ -198,7 +195,8 @@ class FidsBoard:
 
         with self._lock:
             self._by_hex, self._by_reg, self._by_callsign = by_hex, by_reg, by_cs
-            self.entry_count = count
+            self._entries = entries
+            self.entry_count = len(entries)
             # Whichever runway most recent movements used is the one in use.
             self.runway_in_use = max(runways, key=runways.get) if runways else ""
 
@@ -229,9 +227,30 @@ class FidsBoard:
         now = time.time()
         return min(candidates, key=lambda e: e.seconds_from(now))
 
+    def last_and_next(self):
+        """(most recently gone, soonest coming), either may be None.
+
+        Any movement counts - arrival or departure - since "the last/next
+        flight" doesn't distinguish. Restricted to `live` entries (an actual
+        aircraft assigned, per AeroDataBox's "Live" quality flag) - a
+        schedule-only entry's `when` is just the timetable, not a confirmed
+        movement, and reporting "departed 8 min ago" off a delayed or
+        cancelled timetable slot would be actively misleading rather than
+        just imprecise. This means it sometimes reports nothing even when
+        the raw board has entries - that's the honest answer when nothing on
+        the board is confirmed.
+        """
+        with self._lock:
+            entries = list(self._entries)
+        now = time.time()
+        timed = [e for e in entries if e.when is not None and e.live]
+        past = [e for e in timed if e.when.timestamp() <= now]
+        upcoming = [e for e in timed if e.when.timestamp() > now]
+        last = max(past, key=lambda e: e.when.timestamp()) if past else None
+        next_ = min(upcoming, key=lambda e: e.when.timestamp()) if upcoming else None
+        return last, next_
+
     def status(self) -> str:
-        if not config.FIDS_ENABLED:
-            return ""
         key = getattr(config, "AERODATABOX_KEY", "")
         if not key or key == "PUT_YOUR_KEY_HERE":
             return "no board key"
@@ -242,5 +261,11 @@ class FidsBoard:
         mins = int((time.time() - self.refreshed_at) / 60)
         note = f"board {mins}m old"
         if self.runway_in_use:
-            note += f" \u00b7 rwy {self.runway_in_use}"
+            note += f" · rwy {self.runway_in_use}"
         return note
+
+
+# One board, shared by every app that wants it (planes, home) - so however
+# many screens are interested, the airport is only ever asked once per
+# FIDS_REFRESH_MINUTES, not once per app.
+BOARD = FidsBoard()
